@@ -1,0 +1,14 @@
+# Local Python environment
+.venv/
+
+# Python and pytest caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# PyInstaller intermediates and generated distributions
+/build*/
+/dist*/
+**/build*/
+**/dist*/
+*.spec
