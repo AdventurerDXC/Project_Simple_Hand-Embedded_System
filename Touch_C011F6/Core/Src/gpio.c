@@ -49,6 +49,13 @@ void MX_GPIO_Init(void)
   __HAL_RCC_GPIOA_CLK_ENABLE();
   __HAL_RCC_GPIOB_CLK_ENABLE();
 
+  /* USER CODE BEGIN MX_GPIO_Init_1 */
+  GPIO_InitStruct.Pin = USART_TX_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
+  HAL_GPIO_Init(USART_TX_GPIO_Port, &GPIO_InitStruct);
+  /* USER CODE END MX_GPIO_Init_1 */
+
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOA, Y0_Pin|Y1_Pin|Y2_Pin|Y3_Pin
                           |Y4_Pin|Y5_Pin|EN_Pin|S0_Pin

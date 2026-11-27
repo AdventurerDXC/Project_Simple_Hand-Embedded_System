@@ -82,11 +82,37 @@ class SerialReader(QThread):
         motor_id: int,
         sequence: int,
     ) -> bool:
-        """Atomically register and enqueue a command's matching motor response."""
+        """Queue a motor command with its ID and sequence metadata."""
 
         if not 0 <= motor_id < MOTOR_COUNT or not 0 <= sequence <= 0xFF:
             return False
         return self._enqueue(data, ((motor_id, sequence),))
+
+    def enqueue_motor_disable_poll(
+        self,
+        data: bytes,
+        motor_id: int,
+        sequence: int,
+    ) -> bool:
+        """Queue at most one pending periodic DISABLE per motor."""
+
+        if not 0 <= motor_id < MOTOR_COUNT or not 0 <= sequence <= 0xFF:
+            return False
+        return self._enqueue(
+            data,
+            ((motor_id, sequence),),
+            coalesce_key=f"disable-poll-{motor_id}",
+        )
+
+    def cancel_motor_disable_polls(self) -> None:
+        """Remove unsent periodic DISABLEs before a new control operation."""
+
+        with self._write_queue_lock:
+            self._write_queue = deque(
+                queued for queued in self._write_queue
+                if queued.coalesce_key is None
+                or not queued.coalesce_key.startswith("disable-poll-")
+            )
 
     def enqueue_motor_batch(
         self,
@@ -214,12 +240,6 @@ class SerialReader(QThread):
                         raise serial.SerialTimeoutException(
                             f"仅写入 {written}/{len(outgoing.data)} 字节"
                         )
-                    if outgoing.preserve_on_stop:
-                        for motor_id in range(MOTOR_COUNT):
-                            motor_parser.expect_response(motor_id, outgoing.data[3])
-                    else:
-                        for motor_id, sequence in outgoing.expected_responses:
-                            motor_parser.expect_response(motor_id, sequence)
                     continue
 
                 if self._stop_event.is_set():

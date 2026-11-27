@@ -29,9 +29,12 @@ HAL_StatusTypeDef MA782_Driver_Init(MA782_Driver *hdev, q15_t* data, q15_t origi
     HAL_GPIO_WritePin(hdev->cs_port, hdev->cs_pin, GPIO_PIN_SET);
     MA782_Driver_WriteReg(hdev, MA782_REG_CYCLE_TIME_LOW, 25);
     MA782_Driver_WriteReg(hdev, MA782_REG_CYCLE_TIME_HIGH, 0);
-    MA782_Driver_WriteReg(hdev, MA782_REG_ROTATION_DIRECTION, 0);
+    if(motor_type == 0)
+        MA782_Driver_WriteReg(hdev, MA782_REG_ROTATION_DIRECTION, 0);
     
     if(motor_type == 1) {
+        MA782_Driver_WriteReg(hdev, MA782_REG_ROTATION_DIRECTION, 0x80);
+        
         MA782_Driver_WriteReg(hdev, MA782_REG_ENABLE_TRIM_Y, 2);
         MA782_Driver_WriteReg(hdev, MA782_REG_BIAS_TRIM, 152);
     }

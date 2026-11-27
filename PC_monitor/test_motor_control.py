@@ -235,26 +235,15 @@ def test_unmatched_motor_response_does_not_advance_calibration(
     page = MotorControlPage(lambda *_args: True)
     page.set_connected(True)
     page._calibration_stage = "calibrating"
-    page._calibration_waiting.add(3)
-    page._active_motor_id = 3
-    response = MotorResponse(
-        3,
-        1,
-        0,
-        12.0,
-        30.0,
-        STATUS_ZERO_CALIBRATING,
-        1.0,
-    )
+    response = MotorResponse(3, 1, 0, 12.0, 30.0, STATUS_ZERO_VALID, 1.0)
 
     page.handle_motor_response(response)
 
-    assert page._calibration_waiting == {3}
-    assert page._calibration_accepted == set()
-    assert page._motor_cards[3].bus_voltage_label.text() == "\u6bcd\u7ebf 12.00 V"
+    assert page._calibration_command_replies == set()
+    assert page._calibration_success == set()
+    assert page._motor_cards[3].bus_voltage_label.text() == "母线 12.00 V"
     page.set_connected(False)
     page.close()
-
 
 def test_motor_toolbar_is_one_row_and_long_hint_is_removed(
     app: QApplication,
@@ -316,7 +305,7 @@ def test_calibration_disables_first_then_verifies_zero_valid_status(
         for entry in sent
         if entry[1] == COMMAND_DISABLE and entry[3] is not None
     ]
-    assert [motor_id for motor_id, _, _, _ in verification_commands] == list(
+    assert [motor_id for motor_id, _, _, _ in verification_commands[:17]] == list(
         range(17)
     )
 
@@ -338,68 +327,37 @@ def test_calibration_progress_reports_flags_not_verified_success(app: QApplicati
     page.close()
 
 
-def test_lost_calibration_ack_is_recovered_from_matching_busy_status(
+def test_calibration_response_requires_matching_id_and_current_generation(
     app: QApplication,
 ) -> None:
-    sent: list[tuple[int, int, float, object]] = []
-
-    def send_command(motor_id, command, value, callback=None):
-        sent.append((motor_id, command, value, callback))
-        return True
-
-    page = MotorControlPage(send_command)
+    page = MotorControlPage(lambda *_args: True)
     page.set_connected(True)
-    page._calibrate_all()
-    assert wait_until(
-        lambda: sum(command == COMMAND_CALIBRATE_ZERO for _, command, _, _ in sent) == 1,
-        timeout_ms=2000,
-    )
-
-    # The first response is deliberately lost. The first matching DISABLE
-    # status response confirms that CAL_ZERO was accepted and is still busy.
-    assert wait_until(
-        lambda: sum(
-            command == COMMAND_DISABLE and callback is not None
-            for _, command, _, callback in sent
-        ) == 1,
-        timeout_ms=2000,
-    )
-    verification = next(
-        entry
-        for entry in sent
-        if entry[1] == COMMAND_DISABLE and entry[3] is not None
-    )
-    motor_id, _, _, callback = verification
-    callback(
-        MotorResponse(
-            motor_id,
-            1,
-            0,
-            0.0,
-            0.0,
-            STATUS_ZERO_CALIBRATING,
-            0.0,
-        )
-    )
-
-    assert motor_id in page._calibration_accepted
-    assert page._calibration_in_progress == motor_id
-    assert page._sweep_index == 0
+    page._calibration_stage = "calibrating"
+    generation = page._calibration_generation
+    response = MotorResponse(5, 1, 0, 0.0, 0.0, STATUS_ZERO_VALID, 0.0)
+    page._on_calibration_response(6, generation, response)
+    assert page._calibration_command_replies == set()
+    page._on_calibration_response(5, generation, response)
+    assert page._calibration_command_replies == {5}
+    assert page._calibration_success == {5}
+    page.set_connected(False)
+    page.set_connected(True)
+    page._calibration_stage = "calibrating"
+    page._on_calibration_response(5, generation, response)
+    assert page._calibration_command_replies == set()
     page.set_connected(False)
     page.close()
-
 
 def test_calibration_skips_absent_ids_and_reaches_installed_finger(
     app: QApplication,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(motor_control_module, "CALIBRATION_COMMAND_GUARD_MS", 5)
     monkeypatch.setattr(motor_control_module, "CALIBRATION_SETTLE_MS", 2)
-    monkeypatch.setattr(motor_control_module, "CALIBRATION_RESPONSE_TIMEOUT_MS", 20)
-    monkeypatch.setattr(motor_control_module, "CALIBRATION_RETRY_MS", 2)
-    monkeypatch.setattr(motor_control_module, "CALIBRATION_TIMEOUT_MS", 5000)
+    monkeypatch.setattr(motor_control_module, "CALIBRATION_SWITCH_MS", 10)
+    monkeypatch.setattr(motor_control_module, "COMMAND_SLOT_INTERVAL_MS", 1)
+    monkeypatch.setattr(motor_control_module, "CALIBRATION_TIMEOUT_MS", 100)
 
-    installed_ids = set(range(13, 17))
+    installed_ids = set(range(5, 9))
     sent: list[tuple[int, int, object]] = []
 
     def send_command(motor_id, command, _value, callback=None):
@@ -440,9 +398,8 @@ def test_calibration_skips_absent_ids_and_reaches_installed_finger(
     ]
     assert attempted_ids == list(range(MOTOR_COUNT))
     assert page._calibration_success == installed_ids
-    assert page._calibration_failed == set(range(13))
-    assert installed_ids <= page._calibration_command_replies
-    assert "失败" in page.status_label.text()
+    assert page._calibration_command_replies == installed_ids
+    assert "未收到响应" in page.status_label.text()
     assert "0, 1, 2" in page.status_label.text()
     assert "收到零点有效标志" in page.status_label.text()
     assert "不能确认本次校零成功" in page.status_label.text()
@@ -471,6 +428,116 @@ def test_main_window_serial_shutdown_waits_for_worker_finished(
     window._close_after_shutdown = False
     window._shutdown_pending = False
     window.close()
+
+
+def test_calibration_single_round_then_periodic_disable_until_enable(
+    app: QApplication, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from time import monotonic
+
+    monkeypatch.setattr(motor_control_module, "CALIBRATION_SETTLE_MS", 5)
+    monkeypatch.setattr(motor_control_module, "CALIBRATION_SWITCH_MS", 60)
+    monkeypatch.setattr(motor_control_module, "CALIBRATION_TIMEOUT_MS", 100)
+    monkeypatch.setattr(motor_control_module, "COMMAND_SLOT_INTERVAL_MS", 1)
+    sent = []
+
+    def send(motor_id, command, value, callback=None):
+        sent.append((monotonic(), motor_id, command, callback))
+        return True
+
+    page = MotorControlPage(send)
+    page.set_connected(True)
+    page._calibrate_all()
+    assert wait_until(lambda: sum(x[2] == COMMAND_CALIBRATE_ZERO for x in sent) == 17)
+    cal = [x for x in sent if x[2] == COMMAND_CALIBRATE_ZERO]
+    assert [x[1] for x in cal] == list(range(MOTOR_COUNT))
+    after_cal = len(sent)
+    QTest.qWait(15)
+    assert len(sent) == after_cal
+    assert wait_until(lambda: len(sent) >= after_cal + 17)
+    after = sent[after_cal:]
+    assert all(x[2] == COMMAND_DISABLE for x in after)
+    assert [x[1] for x in after[:17]] == list(range(MOTOR_COUNT))
+    assert after[0][0] - cal[-1][0] >= 0.045
+    assert wait_until(lambda: len(sent) >= after_cal + 34)
+    assert sum(x[2] == COMMAND_CALIBRATE_ZERO for x in sent) == 17
+    assert wait_until(lambda: page._calibration_stage is None)
+    page._toggle_enabled()
+    assert wait_until(lambda: any(x[2] == COMMAND_ENABLE for x in sent))
+    enable_index = next(i for i, x in enumerate(sent) if x[2] == COMMAND_ENABLE)
+    QTest.qWait(90)
+    assert all(x[2] != COMMAND_DISABLE for x in sent[enable_index:])
+    page.set_connected(False)
+    page.close()
+
+
+def test_partial_calibration_enqueue_failure_starts_disable_polling(
+    app: QApplication, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(motor_control_module, "CALIBRATION_SETTLE_MS", 1)
+    monkeypatch.setattr(motor_control_module, "COMMAND_SLOT_INTERVAL_MS", 1)
+    commands = []
+    polls = []
+
+    def send(motor_id, command, _value, _callback=None):
+        commands.append((motor_id, command))
+        return not (motor_id == 2 and command == COMMAND_CALIBRATE_ZERO)
+
+    page = MotorControlPage(
+        send,
+        send_disable_poll=lambda motor_id, command, *_args:
+            polls.append((motor_id, command)) or True,
+    )
+    try:
+        page.set_connected(True)
+        page._calibrate_all()
+        assert wait_until(lambda: bool(polls))
+        assert [motor_id for motor_id, command in commands
+                if command == COMMAND_CALIBRATE_ZERO] == [0, 1, 2]
+        assert (0xFF, COMMAND_DISABLE) in commands
+        assert polls[0] == (0, COMMAND_DISABLE)
+        assert "不能确认各板状态" in page.status_label.text()
+        QTest.qWait(25)
+        assert len([command for _, command in commands
+                    if command == COMMAND_CALIBRATE_ZERO]) == 3
+    finally:
+        page.set_connected(False)
+        page.close()
+
+
+def test_disable_poll_retries_enqueue_failure_and_stops_on_disconnect(
+    app: QApplication, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(motor_control_module, "DISABLE_ROUND_INTERVAL_MS", 5)
+    attempts = []
+    cancel_calls = []
+
+    def send_poll(motor_id, command, value, callback=None):
+        attempts.append((motor_id, command))
+        return len(attempts) > 1
+
+    page = MotorControlPage(
+        lambda *_args: True,
+        send_disable_poll=send_poll,
+        cancel_disable_polls=lambda: cancel_calls.append(True),
+    )
+    try:
+        page.set_connected(True)
+        page._start_disable_polling()
+        assert attempts == [(0, COMMAND_DISABLE)]
+        assert "正在重试" in page.status_label.text()
+        assert wait_until(lambda: len(attempts) >= 2)
+        assert attempts[1] == (0, COMMAND_DISABLE)
+        assert page._disable_polling
+        page.set_connected(False)
+        stopped_count = len(attempts)
+        QTest.qWait(30)
+        assert len(attempts) == stopped_count
+        assert not page._disable_poll_timer.isActive()
+        assert cancel_calls
+    finally:
+        page.set_connected(False)
+        page.close()
 
 
 def test_disconnect_stops_pending_motor_position_timer(app: QApplication) -> None:

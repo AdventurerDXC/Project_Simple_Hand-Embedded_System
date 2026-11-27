@@ -10,7 +10,7 @@ extern "C" {
 #include "tactile_sense.h"
 #include <stdint.h>
 
-#define SENSOR_BOARD_ID             11U
+#define SENSOR_BOARD_ID             10U
 
 #define COM_FRAME_HEADER_SIZE       2U
 #define COM_BOARD_ID_SIZE           1U
@@ -40,6 +40,9 @@ HAL_StatusTypeDef COM_Init(
     UART_HandleTypeDef *huart,
     uint8_t board_id,
     const uint16_t initial_data[TACTILE_POINT_NUM]);
+
+/* Retry failed reception and release TX if a response stalls. */
+void COM_Process(void);
 
 /**
  * @brief 发布最新完整扫描；轮询响应在UART接收回调中立即启动。

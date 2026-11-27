@@ -7,12 +7,15 @@ Set-Location -LiteralPath $PSScriptRoot
 
 $python = Join-Path $PSScriptRoot '.venv\Scripts\python.exe'
 $exitCode = 0
+$stagingDirectory = $null
+$preserveStaging = $false
 
 try {
     Write-Host 'PCMonitor Windows EXE build'
 
+    Write-Host '[1/6] Checking the project virtual environment...'
     if (-not (Test-Path -LiteralPath $python)) {
-        Write-Host '[1/6] Creating the project virtual environment...'
+        Write-Host 'Creating the project virtual environment...'
         $launcher = Get-Command py.exe -ErrorAction SilentlyContinue
         if (-not $launcher) {
             $launcher = Get-Command python.exe -ErrorAction SilentlyContinue
@@ -22,7 +25,7 @@ try {
         }
 
         if (Test-Path -LiteralPath (Join-Path $PSScriptRoot '.venv')) {
-            Remove-Item -LiteralPath (Join-Path $PSScriptRoot '.venv') -Recurse -Force
+            throw 'The existing .venv has no Python executable. Repair it before building.'
         }
 
         if ($launcher.Name -eq 'py.exe') {
@@ -45,23 +48,31 @@ try {
         throw 'A 64-bit Python 3.10 or newer is required.'
     }
 
-    Write-Host '[2/6] Installing project dependencies...'
-    & $python -m pip install -r (Join-Path $PSScriptRoot 'requirements.txt')
+    Write-Host '[2/6] Checking project dependencies...'
+    & $python -c "import PySide6, serial, PyInstaller"
     if ($LASTEXITCODE -ne 0) {
-        throw 'Dependency installation failed.'
+        Write-Host 'Installing project dependencies...'
+        & $python -m pip install -r (Join-Path $PSScriptRoot 'requirements.txt')
+        if ($LASTEXITCODE -ne 0) {
+            throw 'Dependency installation failed.'
+        }
     }
 
-    Write-Host '[3/6] Installing GUI test dependency...'
-    & $python -m pip install 'pytest>=8,<9'
+    Write-Host '[3/6] Checking GUI test dependency...'
+    & $python -c "import pytest"
     if ($LASTEXITCODE -ne 0) {
-        throw 'Could not install pytest for the motor control smoke tests.'
+        Write-Host 'Installing GUI test dependency...'
+        & $python -m pip install 'pytest>=8,<9'
+        if ($LASTEXITCODE -ne 0) {
+            throw 'Could not install pytest for the motor control smoke tests.'
+        }
     }
 
     Write-Host '[4/6] Running GUI and protocol tests...'
     $previousQtPlatform = $env:QT_QPA_PLATFORM
     $env:QT_QPA_PLATFORM = 'offscreen'
     try {
-        & $python -m pytest -q --tb=short --basetemp (Join-Path $env:TEMP 'pc_monitor_pytest_temp')
+        & $python -m pytest -q --tb=short -p no:cacheprovider
         $testExitCode = $LASTEXITCODE
     }
     finally {
@@ -78,68 +89,34 @@ try {
 
     Write-Host '[5/6] Preparing build output...'
     $distDirectory = Join-Path $PSScriptRoot 'dist'
-    $distFixedDirectory = Join-Path $PSScriptRoot 'dist_fixed'
     $distPrefix = $distDirectory.TrimEnd('\') + '\'
-    $distFixedPrefix = $distFixedDirectory.TrimEnd('\') + '\'
     $runningApps = @(
         Get-Process -Name 'PCMonitor' -ErrorAction SilentlyContinue |
             Where-Object {
-                $_.Path -and (
-                    $_.Path.StartsWith(
-                        $distPrefix,
-                        [System.StringComparison]::OrdinalIgnoreCase
-                    ) -or
-                    $_.Path.StartsWith(
-                        $distFixedPrefix,
-                        [System.StringComparison]::OrdinalIgnoreCase
-                    )
+                $_.Path -and $_.Path.StartsWith(
+                    $distPrefix,
+                    [System.StringComparison]::OrdinalIgnoreCase
                 )
             }
     )
     if ($runningApps.Count -gt 0) {
-        $processIds = ($runningApps | ForEach-Object { $_.ProcessId }) -join ', '
+        $processIds = ($runningApps | ForEach-Object { $_.Id }) -join ', '
         throw "PCMonitor is still running (PID: $processIds). Close it before rebuilding."
     }
 
-    foreach ($path in @('build', 'PCMonitor.spec')) {
-        $target = Join-Path $PSScriptRoot $path
-        if (Test-Path -LiteralPath $target) {
-            Remove-Item -LiteralPath $target -Recurse -Force
-        }
-    }
-
-    if (Test-Path -LiteralPath $distDirectory) {
-        try {
-            Remove-Item -LiteralPath $distDirectory -Recurse -Force -ErrorAction Stop
-        }
-        catch {
-            Write-Warning "Could not replace 'dist': $($_.Exception.Message)"
-            Write-Warning 'The previous build has been preserved; creating the new build in dist_fixed.'
-            if (Test-Path -LiteralPath $distFixedDirectory) {
-                Remove-Item -LiteralPath $distFixedDirectory -Recurse -Force
-            }
-            $distDirectory = $distFixedDirectory
-        }
-    }
-    $buildDirectory = if ($distDirectory -eq $distFixedDirectory) {
-        Join-Path $PSScriptRoot 'build_fixed'
-    }
-    else {
-        Join-Path $PSScriptRoot 'build'
-    }
-    $specDirectory = $buildDirectory
-    if (Test-Path -LiteralPath $buildDirectory) {
-        Remove-Item -LiteralPath $buildDirectory -Recurse -Force
-    }
-    New-Item -ItemType Directory -Path $buildDirectory -Force | Out-Null
+    $stagingDirectory = Join-Path $PSScriptRoot ('.pcmonitor-build-' + [guid]::NewGuid().ToString('N'))
+    $stagedDist = Join-Path $stagingDirectory 'dist'
+    $buildDirectory = Join-Path $stagingDirectory 'build'
+    $backupDirectory = Join-Path $stagingDirectory 'previous'
+    New-Item -ItemType Directory -Path $stagingDirectory -ErrorAction Stop | Out-Null
 
     Write-Host '[6/6] Building the single-file GUI executable...'
-    & $python -m PyInstaller --noconfirm --clean --onefile --windowed --name PCMonitor --distpath $distDirectory --workpath $buildDirectory --specpath $specDirectory main.py
+    & $python -m PyInstaller --noconfirm --onefile --windowed --name PCMonitor --distpath $stagedDist --workpath $buildDirectory --specpath $stagingDirectory main.py
     if ($LASTEXITCODE -ne 0) {
         throw 'PyInstaller failed. Review the output above for details.'
     }
 
-    $executable = Join-Path $distDirectory 'PCMonitor.exe'
+    $executable = Join-Path $stagedDist 'PCMonitor.exe'
     if (-not (Test-Path -LiteralPath $executable)) {
         throw 'PyInstaller returned successfully, but the executable was not found.'
     }
@@ -148,17 +125,38 @@ try {
     if (-not (Test-Path -LiteralPath $qtPluginSource)) {
         throw "Required Qt Windows platform plugin was not found: $qtPluginSource"
     }
-    $qtPluginDirectory = Join-Path $distDirectory 'PySide6\plugins\platforms'
+    $qtPluginDirectory = Join-Path $stagedDist 'PySide6\plugins\platforms'
     New-Item -ItemType Directory -Path $qtPluginDirectory -Force | Out-Null
     Copy-Item -LiteralPath $qtPluginSource -Destination $qtPluginDirectory -Force
 
     $qtFontsSource = Join-Path $PSScriptRoot '.venv\Lib\site-packages\PySide6\lib\fonts'
     if (Test-Path -LiteralPath $qtFontsSource) {
-        $qtFontsDirectory = Join-Path $distDirectory 'PySide6\lib\fonts'
+        $qtFontsDirectory = Join-Path $stagedDist 'PySide6\lib\fonts'
         New-Item -ItemType Directory -Path $qtFontsDirectory -Force | Out-Null
         Copy-Item -Path (Join-Path $qtFontsSource '*') -Destination $qtFontsDirectory -Recurse -Force
     }
 
+    $hadPrevious = Test-Path -LiteralPath $distDirectory
+    if ($hadPrevious) {
+        Move-Item -LiteralPath $distDirectory -Destination $backupDirectory -ErrorAction Stop
+    }
+    try {
+        Move-Item -LiteralPath $stagedDist -Destination $distDirectory -ErrorAction Stop
+    }
+    catch {
+        if ($hadPrevious) {
+            try {
+                Move-Item -LiteralPath $backupDirectory -Destination $distDirectory -ErrorAction Stop
+            }
+            catch {
+                $preserveStaging = $true
+                throw "Could not restore previous build; it remains at $backupDirectory. $($_.Exception.Message)"
+            }
+        }
+        throw
+    }
+
+    $executable = Join-Path $distDirectory 'PCMonitor.exe'
     Write-Host "Build complete: $executable" -ForegroundColor Green
 }
 catch {
@@ -166,6 +164,15 @@ catch {
     Write-Host "Build failed: $($_.Exception.Message)" -ForegroundColor Red
 }
 finally {
+    if ($stagingDirectory -and -not $preserveStaging -and (Test-Path -LiteralPath $stagingDirectory)) {
+        try {
+            Remove-Item -LiteralPath $stagingDirectory -Recurse -Force -ErrorAction Stop
+        }
+        catch {
+            $exitCode = 1
+            Write-Warning "Could not remove temporary build files at $stagingDirectory`: $($_.Exception.Message)"
+        }
+    }
     if (-not $NoPrompt) {
         [void](Read-Host 'Press Enter to close this window')
     }

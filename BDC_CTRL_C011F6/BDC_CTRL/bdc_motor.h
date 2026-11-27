@@ -30,7 +30,7 @@ typedef struct BDC_Proto_Packet_ BDC_Proto_Packet;
 
 /* Configure a unique ID for each flashed board. */
 #ifndef BOARD_ID
-#define BOARD_ID                  8U
+#define BOARD_ID                  16U
 #endif
 #if (BOARD_ID < 0) || (BOARD_ID >= BDC_num)
 #error "BOARD_ID must be in the range 0..16"

@@ -4,9 +4,9 @@
 #include "main.h"
 
 /* Reserve the final 2 KiB Flash page exclusively for the encoder zero offset. */
-#define ZERO_OFFSET_FLASH_PAGE_SIZE       FLASH_PAGE_SIZE
-#define ZERO_OFFSET_FLASH_PAGE             ((FLASH_SIZE / ZERO_OFFSET_FLASH_PAGE_SIZE) - 1U)
-#define ZERO_OFFSET_FLASH_ADDRESS          (FLASH_BASE + FLASH_SIZE - sizeof(uint64_t))
+#define ZERO_OFFSET_FLASH_PAGE_SIZE        FLASH_PAGE_SIZE                                    // 0x800
+#define ZERO_OFFSET_FLASH_PAGE             ((FLASH_SIZE / ZERO_OFFSET_FLASH_PAGE_SIZE) - 1U)  // 15
+#define ZERO_OFFSET_FLASH_ADDRESS          (FLASH_BASE + FLASH_SIZE - sizeof(uint64_t))       // 0x08000000 + 0x8000 - 8 = 0x8007FF8
 #define ZERO_OFFSET_FLASH_MAGIC            0x5A3CU
 #define ZERO_OFFSET_FLASH_ERASED_VALUE     0xFFFFU
 

@@ -124,6 +124,8 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
+      COM_Process();
+
       /* 20 FPS，TIM1每50ms产生一次采样请求*/
       if (TactileScan_TakeRequest() != 0U) {
         if (TactileSense_Scan(tactile_adc_data) != HAL_OK)

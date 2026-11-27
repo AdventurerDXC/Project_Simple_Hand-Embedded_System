@@ -94,14 +94,6 @@ class MotorResponseParser:
 
     def __init__(self) -> None:
         self._buffer = bytearray()
-        self._expected: dict[int, int] = {}
-
-    def expect_response(self, motor_id: int, sequence: int) -> None:
-        """Replace the current authorized sequence for one motor."""
-
-        if not 0 <= motor_id < MOTOR_COUNT or not 0 <= sequence <= 0xFF:
-            return
-        self._expected[motor_id] = sequence
 
     def feed(
         self,
@@ -153,29 +145,17 @@ class MotorResponseParser:
                     non_motor.append(self._buffer[cursor])
                     cursor += 1
                     continue
-                if remaining < 3:
-                    # The valid motor ID could still be followed by a sequence.
+                if remaining < RESPONSE_SIZE:
                     break
 
-                sequence = self._buffer[cursor + 2]
-                if self._expected.get(motor_id) == sequence:
-                    if remaining < RESPONSE_SIZE:
-                        break
-
-                    candidate = bytes(self._buffer[cursor:cursor + RESPONSE_SIZE])
-                    response = self._decode(candidate)
-                    if response is not None:
-                        responses.append(response)
-                        cursor += RESPONSE_SIZE
-                    else:
-                        # Not the registered reply; preserve it as ordinary stream data.
-                        non_motor.append(self._buffer[cursor])
-                        cursor += 1
-                    continue
-
-                # Only the latest sent sequence for this ID is authorized.
-                non_motor.append(self._buffer[cursor])
-                cursor += 1
+                candidate = bytes(self._buffer[cursor:cursor + RESPONSE_SIZE])
+                response = self._decode(candidate)
+                if response is not None:
+                    responses.append(response)
+                    cursor += RESPONSE_SIZE
+                else:
+                    non_motor.append(self._buffer[cursor])
+                    cursor += 1
                 continue
 
             non_motor.append(self._buffer[cursor])

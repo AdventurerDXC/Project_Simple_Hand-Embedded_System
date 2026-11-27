@@ -7,6 +7,9 @@
 #define COM_TX_GPIO_PORT       USART_TX_GPIO_Port
 #define COM_TX_GPIO_PIN        USART_TX_Pin
 #define COM_TX_GPIO_AF         GPIO_AF0_USART1
+/* With 1 ms ticks, a difference of 3 can represent just over 2 ms. */
+#define COM_TX_TIMEOUT_MS      3U
+#define COM_BOARD_COUNT        12U
 
 /* ===================== 查询协议 ===================== */
 #define COM_POLL_HEADER_0       0xAAU
@@ -32,6 +35,8 @@ static uint8_t s_tx_frame[3][COM_DATA_FRAME_SIZE];
 static volatile uint8_t s_active_force_buffer = 0U;
 static volatile uint8_t s_tx_buffer_index = 0xFFU;
 static volatile uint8_t s_tx_busy = 0U;
+static volatile uint8_t s_rx_restart_needed = 0U;
+static volatile uint32_t s_tx_started_tick = 0U;
 
 static volatile uint16_t s_frame_counter = 0U;
 
@@ -66,7 +71,7 @@ HAL_StatusTypeDef COM_Init(
 {
     uint8_t buffer_index;
 
-    if ((huart == NULL) || (initial_data == NULL))
+    if ((huart == NULL) || (initial_data == NULL) || (board_id >= COM_BOARD_COUNT))
         return HAL_ERROR;
 
     s_huart = huart;
@@ -76,6 +81,8 @@ HAL_StatusTypeDef COM_Init(
     s_active_force_buffer = 0U;
     s_tx_buffer_index = 0xFFU;
     s_tx_busy = 0U;
+    s_rx_restart_needed = 0U;
+    s_tx_started_tick = 0U;
     s_poll_count = 0U;
     s_transmit_count = 0U;
     s_checksum_error_count = 0U;
@@ -92,6 +99,30 @@ HAL_StatusTypeDef COM_Init(
     COM_SetTxHighImpedance();
 
     return COM_StartPollReception();
+}
+
+void COM_Process(void)
+{
+    uint32_t primask;
+
+    if (s_huart == NULL)
+        return;
+
+    primask = __get_PRIMASK();
+    __disable_irq();
+    if ((s_tx_busy != 0U) &&
+        ((uint32_t)(HAL_GetTick() - s_tx_started_tick) >= COM_TX_TIMEOUT_MS))
+    {
+        COM_SetTxHighImpedance();
+        (void)HAL_UART_AbortTransmit(s_huart);
+        s_tx_busy = 0U;
+        s_tx_buffer_index = 0xFFU;
+        s_rx_restart_needed = 1U;
+    }
+    if ((s_rx_restart_needed != 0U) && (s_tx_busy == 0U))
+        (void)COM_StartPollReception();
+    if (primask == 0U)
+        __enable_irq();
 }
 
 /**
@@ -118,9 +149,7 @@ void COM_UpdateTactileData(const uint16_t adc_data[TACTILE_POINT_NUM])
 
     /* Publish the completed frame atomically with respect to the UART ISR. */
     __DMB();
-    __disable_irq();
     s_active_force_buffer = build_buffer;
-    __enable_irq();
 }
 
 /* ===================== UART回调 ===================== */
@@ -146,18 +175,20 @@ void COM_UART_RxEventCallback(UART_HandleTypeDef *huart, uint16_t size)
 
             /* DMA owns the published frame until UART TC. */
             COM_RefreshFrameCounter(s_tx_frame[active_buffer]);
-            COM_SetTxAlternateFunction();
+            s_tx_started_tick = HAL_GetTick();
             s_tx_busy = 1U;
             s_tx_buffer_index = active_buffer;
+            COM_SetTxAlternateFunction();
 
             if (HAL_UART_Transmit_DMA(
                     s_huart,
                     s_tx_frame[active_buffer],
                     COM_DATA_FRAME_SIZE) != HAL_OK)
             {
+                COM_SetTxHighImpedance();
+                (void)HAL_UART_AbortTransmit(s_huart);
                 s_tx_busy = 0U;
                 s_tx_buffer_index = 0xFFU;
-                COM_SetTxHighImpedance();
                 (void)COM_StartPollReception();
             }
             else
@@ -196,10 +227,11 @@ void COM_UART_ErrorCallback(UART_HandleTypeDef *huart)
         (huart->Instance != s_huart->Instance))
         return;
 
-    (void)HAL_UART_DMAStop(s_huart);
+    COM_SetTxHighImpedance();
+    (void)HAL_UART_AbortTransmit(s_huart);
+    (void)HAL_UART_AbortReceive(s_huart);
     s_tx_busy = 0U;
     s_tx_buffer_index = 0xFFU;
-    COM_SetTxHighImpedance();
     (void)COM_StartPollReception();
 }
 
@@ -210,6 +242,9 @@ static HAL_StatusTypeDef COM_StartPollReception(void)
         s_poll_rx_frame,
         COM_POLL_FRAME_SIZE);
 
+    if (status == HAL_OK)
+        __HAL_DMA_DISABLE_IT(s_huart->hdmarx, DMA_IT_HT);
+    s_rx_restart_needed = (status == HAL_OK) ? 0U : 1U;
     return status;
 }
 
@@ -313,7 +348,7 @@ static void COM_SetTxAlternateFunction(void)
 
     gpio_init.Pin = COM_TX_GPIO_PIN;
     gpio_init.Mode = GPIO_MODE_AF_PP;
-    gpio_init.Pull = GPIO_NOPULL;
+    gpio_init.Pull = GPIO_PULLUP;
     gpio_init.Speed = GPIO_SPEED_FREQ_HIGH;
     gpio_init.Alternate = COM_TX_GPIO_AF;
 
@@ -324,11 +359,9 @@ static void COM_SetTxHighImpedance(void)
 {
     GPIO_InitTypeDef gpio_init = {0};
 
-    /* Analog模式会关闭数字输入缓冲，
-     * 可作为较干净的高阻状态。*/
     gpio_init.Pin = COM_TX_GPIO_PIN;
-    gpio_init.Mode = GPIO_MODE_ANALOG;
-    gpio_init.Pull = GPIO_NOPULL;
+    gpio_init.Mode = GPIO_MODE_INPUT;
+    gpio_init.Pull = GPIO_PULLUP;
 
     HAL_GPIO_Init(COM_TX_GPIO_PORT, &gpio_init);
 }

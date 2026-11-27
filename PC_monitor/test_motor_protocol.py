@@ -36,7 +36,6 @@ def test_motor_id_boundaries_for_commands_and_responses() -> None:
     assert MOTOR_COUNT == 17
     assert build_motor_command(16, COMMAND_IMPEDANCE_POSITION)[1] == 16
     parser = MotorResponseParser()
-    parser.expect_response(16, 42)
     responses, passthrough = parser.feed_demultiplexed(build_test_response(16, 42))
     assert [response.motor_id for response in responses] == [16]
     assert passthrough == b""
@@ -47,7 +46,6 @@ def test_motor_id_boundaries_for_commands_and_responses() -> None:
             build_test_response(motor_id, 42)
     invalid_payload = struct.pack("<BBBHffB", 0x5A, 17, 42, 0, 12.0, 30.0, 0)
     invalid_frame = invalid_payload + struct.pack("<H", crc16_ccitt_false(invalid_payload))
-    parser.expect_response(17, 42)
     responses, passthrough = parser.feed_demultiplexed(invalid_frame)
     assert responses == []
     assert passthrough == invalid_frame
@@ -68,7 +66,23 @@ def test_interleaved_tactile_frame_is_preserved_byte_for_byte() -> None:
     assert parsed_tactile[0].board_id == 7
 
 
-def test_valid_registered_motor_response_is_separated_from_tactile() -> None:
+def test_tactile_payload_with_motor_like_frame_is_not_misclassified() -> None:
+    embedded = build_test_response(5, 7, position=1234)
+    values = [int.from_bytes(embedded[i:i + 2], "big") for i in range(0, 16, 2)]
+    tactile = build_test_frame(5, 123, values + [0x5A05] * 28)
+    motor = build_test_response(5, 201, position=1234)
+    parser = MotorResponseParser()
+
+    first, first_tactile = parser.feed_demultiplexed(tactile[:50])
+    second, second_tactile = parser.feed_demultiplexed(tactile[50:] + motor)
+
+    assert first == []
+    assert first_tactile == b""
+    assert [response.sequence for response in second] == [201]
+    assert second_tactile == tactile
+
+
+def test_valid_motor_response_is_separated_from_tactile() -> None:
     tactile = build_test_frame(2, 0x4455, [91] * 36)
     response = build_test_response(
         4,
@@ -79,7 +93,6 @@ def test_valid_registered_motor_response_is_separated_from_tactile() -> None:
         status=1 << 1,
     )
     parser = MotorResponseParser()
-    parser.expect_response(4, 23)
 
     first, first_tactile = parser.feed_demultiplexed(tactile[:40] + response[:9])
     second, second_tactile = parser.feed_demultiplexed(response[9:] + tactile[40:])
@@ -94,54 +107,52 @@ def test_valid_registered_motor_response_is_separated_from_tactile() -> None:
     assert second_tactile == tactile
 
 
-def test_repeated_current_response_survives_until_replaced(
+def test_telemetry_accepts_any_sequence_with_fragments_and_interleaved_tactile(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     clock = [100.0]
     monkeypatch.setattr(motor_protocol_module, "monotonic", lambda: clock[0])
     parser = MotorResponseParser()
     tactile = build_test_frame(2, 12, [91] * 36)
-    parser.expect_response(16, 42)
-    first = build_test_response(16, 42, position=100)
-    second = build_test_response(16, 42, position=200)
+    first = build_test_response(16, 255, position=100)
+    second = build_test_response(16, 0, position=200)
     responses, other = parser.feed_demultiplexed(first + tactile + second[:7])
-    assert [response.position for response in responses] == [100]
+    assert [(response.sequence, response.position) for response in responses] == [(255, 100)]
     assert other == tactile
     clock[0] += 5.0
     responses, other = parser.feed_demultiplexed(second[7:])
-    assert [response.position for response in responses] == [200]
+    assert [(response.sequence, response.position) for response in responses] == [(0, 200)]
     assert other == b""
 
-    parser.expect_response(16, 43)
-    current = build_test_response(16, 43, position=300)
-    responses, other = parser.feed_demultiplexed(second + current + current)
-    assert [response.position for response in responses] == [300, 300]
-    assert other == second
+    older = build_test_response(16, 255, position=300)
+    responses, other = parser.feed_demultiplexed(older + second + second)
+    assert [response.position for response in responses] == [300, 200, 200]
+    assert other == b""
 
 
-def test_current_sequence_still_rejects_bad_crc_wrong_id_and_sequence() -> None:
+def test_invalid_crc_and_nonfinite_values_do_not_produce_telemetry() -> None:
     parser = MotorResponseParser()
-    parser.expect_response(16, 42)
     corrupt = bytearray(build_test_response(16, 42))
     corrupt[-1] ^= 1
-    invalid = bytes(corrupt) + build_test_response(15, 42) + build_test_response(16, 41)
+    payload = struct.pack("<BBBHffB", 0x5A, 5, 99, 1, float("nan"), 30.0, 0)
+    nonfinite = payload + struct.pack("<H", crc16_ccitt_false(payload))
+    invalid = bytes(corrupt) + nonfinite
     responses, other = parser.feed_demultiplexed(invalid)
     assert responses == []
     assert other == invalid
-    valid = build_test_response(16, 42)
-    responses, other = parser.feed_demultiplexed(valid)
+    responses, other = parser.feed_demultiplexed(build_test_response(16, 42))
     assert len(responses) == 1
     assert other == b""
 
 
-def test_motor_response_parser_preserves_unrequested_response_like_data() -> None:
+def test_motor_response_without_prior_command_is_telemetry() -> None:
     response = build_test_response(5, 12)
     parser = MotorResponseParser()
 
     parsed, passthrough = parser.feed_demultiplexed(response)
 
-    assert parsed == []
-    assert passthrough == response
+    assert [(frame.motor_id, frame.sequence) for frame in parsed] == [(5, 12)]
+    assert passthrough == b""
 
 
 def test_motor_stream_preserves_a_split_tactile_header() -> None:
@@ -160,7 +171,6 @@ def test_motor_stream_preserves_a_split_tactile_header() -> None:
 def test_builds_test_response_for_each_valid_motor() -> None:
     for motor_id in range(MOTOR_COUNT):
         parser = MotorResponseParser()
-        parser.expect_response(motor_id, 9)
         responses, passthrough = parser.feed_demultiplexed(
             build_test_response(motor_id, 9)
         )
@@ -184,7 +194,6 @@ def test_motor_response_position_is_converted_from_signed_q15(
     expected_degrees: float,
 ) -> None:
     parser = MotorResponseParser()
-    parser.expect_response(3, 21)
 
     responses, passthrough = parser.feed_demultiplexed(
         build_test_response(3, 21, position=raw_position)

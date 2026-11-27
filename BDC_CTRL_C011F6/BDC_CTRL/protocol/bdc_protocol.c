@@ -6,6 +6,33 @@ Author: Mr.AdventurerDXC
 #include "bdc_protocol.h"
 #include <string.h>
 
+#define BDC_TX_GPIO_PORT GPIOB
+#define BDC_TX_GPIO_PIN  GPIO_PIN_6
+#define BDC_TX_GPIO_AF   GPIO_AF0_USART1
+#define BDC_TX_TIMEOUT_MS 2U
+
+static volatile uint32_t s_tx_started_tick;
+
+static void BDC_Protocol_SetTxOutput(void)
+{
+	GPIO_InitTypeDef gpio = {0};
+	gpio.Pin = BDC_TX_GPIO_PIN;
+	gpio.Mode = GPIO_MODE_AF_PP;
+	gpio.Pull = GPIO_PULLUP;
+	gpio.Speed = GPIO_SPEED_FREQ_HIGH;
+	gpio.Alternate = BDC_TX_GPIO_AF;
+	HAL_GPIO_Init(BDC_TX_GPIO_PORT, &gpio);
+}
+
+static void BDC_Protocol_ReleaseTx(void)
+{
+	GPIO_InitTypeDef gpio = {0};
+	gpio.Pin = BDC_TX_GPIO_PIN;
+	gpio.Mode = GPIO_MODE_INPUT;
+	gpio.Pull = GPIO_PULLUP;
+	HAL_GPIO_Init(BDC_TX_GPIO_PORT, &gpio);
+}
+
 /**
  * @brief Calculate CRC-16/CCITT-FALSE for protocol frames.
  */
@@ -51,6 +78,7 @@ HAL_StatusTypeDef BDC_Protocol_Init(BDC_Protocol* prot, uint8_t board_id)
 		return HAL_ERROR;
 	}
 
+	BDC_Protocol_ReleaseTx();
 	prot->board_id = board_id;
 	prot->tx_pending = 0U;
 	prot->response_required = 0U;
@@ -91,10 +119,12 @@ HAL_StatusTypeDef BDC_Protocol_HandleReceive(BDC_Protocol* prot, uint16_t size,
 	}
 
 	*command_valid = 0U;
-	prot->response_required = 0U;
 
 	/* �� 10 B �¼��������԰봫��������� IDLE ��֡��ֱ�Ӷ������ع� DMA�� */
-	if ((size != BDC_PROTOCOL_REQUEST_SIZE) || (prot->tx_pending != 0U))
+	if (prot->tx_pending != 0U)
+		return HAL_BUSY;
+	prot->response_required = 0U;
+	if (size != BDC_PROTOCOL_REQUEST_SIZE)
 	{
 		return BDC_Protocol_Receive(prot);
 	}
@@ -146,6 +176,7 @@ HAL_StatusTypeDef BDC_Protocol_TransmitResponse(BDC_Protocol* prot, uint16_t pos
                                                  uint8_t status)
 {
 	HAL_StatusTypeDef tx_status;
+	uint32_t primask;
 
 	if ((prot->response_required == 0U) || (prot->tx_pending != 0U))
 	{
@@ -164,17 +195,25 @@ HAL_StatusTypeDef BDC_Protocol_TransmitResponse(BDC_Protocol* prot, uint16_t pos
 		(const uint8_t*)&prot->tx_response,
 		BDC_PROTOCOL_RESPONSE_SIZE - sizeof(prot->tx_response.crc16));
 
-	/* Send the response on TX without changing the independent RX line. */
+	/* Publish ownership before enabling TX interrupts. */
+	primask = __get_PRIMASK();
+	__disable_irq();
+	s_tx_started_tick = HAL_GetTick();
 	prot->tx_pending = 1U;
+	BDC_Protocol_SetTxOutput();
 	/* ���������ͣ������� UART �ж��еȴ� 16 B ȫ���Ƴ��� */
 	tx_status = HAL_UART_Transmit_IT(prot->huart, (uint8_t*)&prot->tx_response,
 	                                 BDC_PROTOCOL_RESPONSE_SIZE);
 	if (tx_status != HAL_OK)
 	{
+		BDC_Protocol_ReleaseTx();
 		prot->tx_pending = 0U;
 		prot->response_required = 0U;
-		(void)BDC_Protocol_Receive(prot);
 	}
+	if (primask == 0U)
+		__enable_irq();
+	if (tx_status != HAL_OK)
+		(void)BDC_Protocol_Receive(prot);
 
 	return tx_status;
 }
@@ -184,9 +223,42 @@ HAL_StatusTypeDef BDC_Protocol_TransmitResponse(BDC_Protocol* prot, uint16_t pos
  */
 HAL_StatusTypeDef BDC_Protocol_HandleTransmitComplete(BDC_Protocol* prot)
 {
+	uint32_t primask = __get_PRIMASK();
+	__disable_irq();
+	if (prot->tx_pending == 0U)
+	{
+		if (primask == 0U)
+			__enable_irq();
+		return HAL_OK;
+	}
+	BDC_Protocol_ReleaseTx();
 	prot->tx_pending = 0U;
 	prot->response_required = 0U;
+	if (primask == 0U)
+		__enable_irq();
 	return BDC_Protocol_Receive(prot);
+}
+
+void BDC_Protocol_Process(BDC_Protocol* prot)
+{
+	uint32_t primask = __get_PRIMASK();
+	uint8_t recover_rx = 0U;
+
+	__disable_irq();
+	if ((prot->tx_pending != 0U) &&
+		((uint32_t)(HAL_GetTick() - s_tx_started_tick) >= BDC_TX_TIMEOUT_MS))
+	{
+		/* Release first: another board may already own the next slot. */
+		BDC_Protocol_ReleaseTx();
+		(void)HAL_UART_AbortTransmit(prot->huart);
+		prot->tx_pending = 0U;
+		prot->response_required = 0U;
+		recover_rx = 1U;
+	}
+	if (primask == 0U)
+		__enable_irq();
+	if (recover_rx != 0U)
+		(void)BDC_Protocol_Receive(prot);
 }
 
 /**

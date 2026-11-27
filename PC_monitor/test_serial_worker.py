@@ -143,19 +143,21 @@ def test_worker_accepts_repeated_and_broadcast_sequences(
     worker.start()
     try:
         assert wait_until(lambda: worker._serial_port is fake_port)
+        fake_port.receive(build_test_response(5, 19, position=9))
+        assert wait_until(lambda: len(responses) == 1)
         command = build_motor_command(16, COMMAND_DISABLE, sequence=42)
         assert worker.enqueue_motor_command(command, 16, 42)
         assert wait_until(lambda: command in fake_port.written)
         fake_port.receive(build_test_response(16, 42, position=1))
-        assert wait_until(lambda: len(responses) == 1)
-        fake_port.receive(build_test_response(16, 42, position=2))
         assert wait_until(lambda: len(responses) == 2)
+        fake_port.receive(build_test_response(16, 42, position=2))
+        assert wait_until(lambda: len(responses) == 3)
         broadcast = build_motor_command(0xFF, COMMAND_DISABLE, sequence=43)
         assert worker.enqueue_write(broadcast)
         assert wait_until(lambda: broadcast in fake_port.written)
-        fake_port.receive(build_test_response(16, 42) + build_test_response(16, 43, position=3))
-        assert wait_until(lambda: len(responses) == 3)
-        assert [response.position for response in responses] == [1, 2, 3]
+        fake_port.receive(build_test_response(16, 42, position=4) + build_test_response(16, 43, position=3))
+        assert wait_until(lambda: len(responses) == 5)
+        assert [response.position for response in responses] == [9, 1, 2, 4, 3]
     finally:
         worker.stop()
         assert worker.wait(2000)
@@ -167,19 +169,23 @@ def test_repeated_telemetry_updates_ui_but_callback_runs_once(app: QApplication)
 
     window = MainWindow()
     parser = MotorResponseParser()
-    parser.expect_response(16, 42)
     callbacks = []
     window._pending_motor_acks[(16, 42)] = (callbacks.append, monotonic() + 3.0)
-    for position in (100, 200):
+    for sequence, position in ((41, 100), (42, 200), (42, 300), (40, 400)):
         responses, other = parser.feed_demultiplexed(
-            build_test_response(16, 42, position=position, bus_voltage=12.5)
+            build_test_response(16, sequence, position=position, bus_voltage=12.5)
         )
         assert other == b""
         assert len(responses) == 1
         window._on_motor_response(responses[0])
-    assert [response.position for response in callbacks] == [100]
+        if sequence == 41:
+            assert callbacks == []
+            assert window.motor_page._motor_cards[16].actual_angle_label.text() == (
+                "实际 +0.55°"
+            )
+    assert [response.position for response in callbacks] == [200]
     assert window.motor_page._motor_cards[16].actual_angle_label.text() == (
-        "实际 +1.10°"
+        "实际 +2.20°"
     )
     window.close()
 
@@ -247,6 +253,50 @@ def test_motor_round_queue_is_bounded_coalesced_and_stops_safely(
     worker.stop()
     assert worker.queued_write_count == 1
     assert worker._write_queue[0].data == replacement_disable
+
+
+def test_periodic_disable_queue_coalesces_and_cancels_without_other_commands() -> None:
+    from motor_protocol import COMMAND_ENABLE
+
+    worker = SerialReader("COM_TEST")
+    worker._serial_port = FakeSerial()
+    old = build_motor_command(5, COMMAND_DISABLE, sequence=1)
+    latest = build_motor_command(5, COMMAND_DISABLE, sequence=2)
+    other = build_motor_command(6, COMMAND_DISABLE, sequence=3)
+    enable = build_motor_command(5, COMMAND_ENABLE, sequence=4)
+    assert worker.enqueue_motor_disable_poll(old, 5, 1)
+    assert worker.enqueue_motor_disable_poll(other, 6, 3)
+    assert worker.enqueue_motor_disable_poll(latest, 5, 2)
+    assert worker.enqueue_motor_command(enable, 5, 4)
+    assert [item.data for item in worker._write_queue] == [other, latest, enable]
+    worker.cancel_motor_disable_polls()
+    assert [item.data for item in worker._write_queue] == [enable]
+
+
+def test_enable_cancels_unsent_periodic_disables(app: QApplication) -> None:
+    from main import MainWindow
+    from motor_protocol import COMMAND_ENABLE
+
+    window = MainWindow()
+    worker = SerialReader("COM_TEST")
+    worker._serial_port = FakeSerial()
+    worker.isRunning = lambda: True
+    window.serial_worker = worker
+    window.connected = True
+    window.motor_page.set_connected(True)
+    try:
+        window.motor_page._start_disable_polling()
+        assert worker.queued_write_count == 1
+        window.motor_page._toggle_enabled()
+        assert len(worker._write_queue) == 1
+        assert worker._write_queue[0].data[2] == COMMAND_ENABLE
+        assert worker._write_queue[0].data[1] == 0
+        assert not window.motor_page._disable_poll_timer.isActive()
+    finally:
+        window.motor_page.set_connected(False)
+        window.serial_worker = None
+        window.connected = False
+        window.close()
 
 
 def test_motor_queue_accepts_last_id_and_rejects_out_of_range() -> None:

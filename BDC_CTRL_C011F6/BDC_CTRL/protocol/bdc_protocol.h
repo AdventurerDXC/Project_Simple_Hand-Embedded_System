@@ -17,7 +17,7 @@ extern "C" {
 #define BDC_PROTOCOL_RX_SOF                0xA5U
 #define BDC_PROTOCOL_TX_SOF                0x5AU
 #define BDC_PROTOCOL_BROADCAST_ID          0xFFU
-#define BDC_PROTOCOL_COMMAND_TIMEOUT_MS    1000U
+#define BDC_PROTOCOL_COMMAND_TIMEOUT_MS    5000U
 
 
 #define BDC_PROTOCOL_REQUEST_SIZE           10U
@@ -100,6 +100,7 @@ HAL_StatusTypeDef BDC_Protocol_TransmitResponse(BDC_Protocol* prot, uint16_t pos
                                                  float32_t Uvm, float32_t bdc_temp,
                                                  uint8_t status);
 HAL_StatusTypeDef BDC_Protocol_HandleTransmitComplete(BDC_Protocol* prot);
+void BDC_Protocol_Process(BDC_Protocol* prot);
 uint8_t BDC_Protocol_IsCommandTimedOut(const BDC_Protocol* prot, uint32_t now_tick);
 
 #endif

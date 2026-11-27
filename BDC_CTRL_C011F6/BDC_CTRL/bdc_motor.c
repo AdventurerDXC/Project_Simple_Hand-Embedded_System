@@ -76,7 +76,7 @@ HAL_StatusTypeDef BDC_Motor_Init(BDC_Motor* ctrl)
         
     if(ctrl->motor == N20_1218) {
         PID_Controller_Init(ctrl->pid, &pid_data, 0.002914, 0.0014583, 0, -0.99, 0.99);
-        IMP_Controller_Init(ctrl->imp, &imp_data, 15, 0.2, -300, 300);
+        IMP_Controller_Init(ctrl->imp, &imp_data, 10, 0.2, -300, 300);
     }
         
 
@@ -99,6 +99,7 @@ HAL_StatusTypeDef BDC_Motor_Init(BDC_Motor* ctrl)
 		return HAL_ERROR;
 	}
     
+    MA782_Driver_Read(ctrl->mps);
     
 	return HAL_OK;
 }
@@ -199,11 +200,12 @@ HAL_StatusTypeDef BDC_Motor_Run(BDC_Motor* ctrl)
 
 void BDC_Motor_Process(BDC_Motor *ctrl)
 {
-	if ((ctrl->motor_enabled != 0U) &&
-		(BDC_Protocol_IsCommandTimedOut(ctrl->proto, HAL_GetTick()) != 0U))
-	{
-		(void)BDC_Motor_Disable(ctrl);
-	}
+	BDC_Protocol_Process(ctrl->proto);
+//	if ((ctrl->motor_enabled != 0U) &&
+//		(BDC_Protocol_IsCommandTimedOut(ctrl->proto, HAL_GetTick()) != 0U))
+//	{
+//		(void)BDC_Motor_Disable(ctrl);
+//	}
 
 	if (ctrl->zero_calibrate_request == 0U)
 	{
@@ -334,9 +336,14 @@ void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
 
 void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
 {
+	if ((huart != &huart1) || (main_core == NULL) || (main_core->proto == NULL))
+		return;
 	__HAL_UART_CLEAR_OREFLAG(huart);
 	__HAL_UART_CLEAR_FEFLAG(huart); // 清除帧错误标志
 	__HAL_UART_CLEAR_NEFLAG(huart); // 清除噪声错误标志
 	__HAL_UART_CLEAR_PEFLAG(huart); // 清除奇偶校验错误标志
-	(void)BDC_Protocol_Receive(main_core->proto);
+	if (main_core->proto->tx_pending == 0U)
+	{
+		(void)BDC_Protocol_Receive(main_core->proto);
+	}
 }

@@ -417,6 +417,8 @@ class MainWindow(QMainWindow):
         self.motor_page = MotorControlPage(
             self.send_motor_command,
             send_position_round=self.send_motor_position_round,
+            send_disable_poll=self.send_motor_disable_poll,
+            cancel_disable_polls=self.cancel_motor_disable_polls,
         )
 
         self.pages.addWidget(self.connection_page)
@@ -652,6 +654,36 @@ class MainWindow(QMainWindow):
         value: float,
         on_response: Callable[[object], None] | None = None,
     ) -> bool:
+        return self._enqueue_motor_command(
+            motor_id, command, value, on_response, disable_poll=False
+        )
+
+    def send_motor_disable_poll(
+        self,
+        motor_id: int,
+        command: int,
+        value: float,
+        on_response: Callable[[object], None] | None = None,
+    ) -> bool:
+        if command != COMMAND_DISABLE or motor_id == 0xFF:
+            return False
+        return self._enqueue_motor_command(
+            motor_id, command, value, on_response, disable_poll=True
+        )
+
+    def cancel_motor_disable_polls(self) -> None:
+        if self.serial_worker is not None:
+            self.serial_worker.cancel_motor_disable_polls()
+
+    def _enqueue_motor_command(
+        self,
+        motor_id: int,
+        command: int,
+        value: float,
+        on_response: Callable[[object], None] | None,
+        *,
+        disable_poll: bool,
+    ) -> bool:
         worker = self.serial_worker
         if not self.connected or worker is None or not worker.isRunning():
             return False
@@ -677,7 +709,10 @@ class MainWindow(QMainWindow):
                 on_response,
                 monotonic() + 3.0,
             )
-        queued = worker.enqueue_motor_command(frame, motor_id, sequence)
+        if disable_poll:
+            queued = worker.enqueue_motor_disable_poll(frame, motor_id, sequence)
+        else:
+            queued = worker.enqueue_motor_command(frame, motor_id, sequence)
         if not queued and on_response is not None:
             self._pending_motor_acks.pop(response_key, None)
         return queued
@@ -727,8 +762,7 @@ class MainWindow(QMainWindow):
             return
 
         callback, expires_at = pending
-        # SerialReader has already validated the ID, sequence, and CRC.
-        # Only callbacks registered for this exact request affect control flow.
+        # Only callbacks registered for this exact ID and sequence affect control flow.
         if monotonic() <= expires_at and isinstance(status, int):
             callback(response)
 

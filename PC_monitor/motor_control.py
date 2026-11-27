@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from time import monotonic
 
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtWidgets import (
@@ -27,7 +26,6 @@ from motor_protocol import (
     COMMAND_ENABLE,
     COMMAND_IMPEDANCE_POSITION,
     MOTOR_COUNT,
-    STATUS_ZERO_CALIBRATING,
     STATUS_ZERO_VALID,
     MotorResponse,
 )
@@ -47,10 +45,9 @@ POSITION_ROUND_INTERVAL_MS = 50
 COMMAND_SLOT_INTERVAL_MS = 3
 ENABLE_SETTLE_MS = 100
 CALIBRATION_SETTLE_MS = 100
-CALIBRATION_COMMAND_GUARD_MS = POSITION_ROUND_INTERVAL_MS * 2 + 20
-CALIBRATION_RETRY_MS = 100
-CALIBRATION_RESPONSE_TIMEOUT_MS = 350
-CALIBRATION_TIMEOUT_MS = 15000
+CALIBRATION_SWITCH_MS = 50
+DISABLE_ROUND_INTERVAL_MS = 50
+CALIBRATION_TIMEOUT_MS = 350
 
 SendMotorCommand = Callable[
     [int, int, float, Callable[[MotorResponse], None] | None],
@@ -193,10 +190,15 @@ class MotorControlPage(QWidget):
         parent: QWidget | None = None,
         *,
         send_position_round: SendPositionRound | None = None,
+        send_disable_poll: SendMotorCommand | None = None,
+        cancel_disable_polls: Callable[[], None] | None = None,
     ) -> None:
         super().__init__(parent)
         self._send_command = send_command
         self._send_position_round = send_position_round
+        self._send_disable_poll = send_disable_poll or send_command
+        self._cancel_disable_polls = cancel_disable_polls
+        self._disable_poll_error = False
         self._connected = False
         self._enabled = False
         self._enable_settle_pending = False
@@ -205,7 +207,6 @@ class MotorControlPage(QWidget):
         self._sweep_kind: str | None = None
         self._sweep_ids: list[int] = []
         self._sweep_index = 0
-        self._active_motor_id: int | None = None
         self._sweep_value = 0.0
 
         self._position_round_active = False
@@ -214,16 +215,11 @@ class MotorControlPage(QWidget):
         self._last_motor_response_at: dict[int, float] = {}
 
         self._calibration_stage: str | None = None
-        self._calibration_waiting: set[int] = set()
+        self._calibration_generation = 0
         self._calibration_command_replies: set[int] = set()
-        self._calibration_accepted: set[int] = set()
-        self._calibration_started_at: dict[int, float] = {}
-        self._calibration_verification_waiting: set[int] = set()
-        self._calibration_verification_scheduled: set[int] = set()
-        self._calibration_response_motor_id: int | None = None
-        self._calibration_in_progress: int | None = None
         self._calibration_success: set[int] = set()
-        self._calibration_failed: set[int] = set()
+        self._disable_polling = False
+        self._disable_round_index: int | None = None
 
         self._slot_timer = QTimer(self)
         self._slot_timer.setSingleShot(True)
@@ -251,11 +247,10 @@ class MotorControlPage(QWidget):
             self._on_calibration_timeout
         )
 
-        self._calibration_response_timer = QTimer(self)
-        self._calibration_response_timer.setSingleShot(True)
-        self._calibration_response_timer.timeout.connect(
-            self._on_calibration_response_timeout
-        )
+        self._disable_poll_timer = QTimer(self)
+        self._disable_poll_timer.setSingleShot(True)
+        self._disable_poll_timer.setTimerType(Qt.PreciseTimer)
+        self._disable_poll_timer.timeout.connect(self._on_disable_poll_timer)
 
         root = QVBoxLayout(self)
         root.setContentsMargins(24, 20, 24, 20)
@@ -376,18 +371,11 @@ class MotorControlPage(QWidget):
             self._sweep_kind = None
             self._enable_settle_pending = False
             self._disable_settle_pending = False
+            self._calibration_generation += 1
             self._calibration_stage = None
-            self._calibration_waiting.clear()
             self._calibration_command_replies.clear()
-            self._calibration_accepted.clear()
-            self._calibration_started_at.clear()
-            self._calibration_verification_waiting.clear()
-            self._calibration_verification_scheduled.clear()
-            self._calibration_response_timer.stop()
-            self._calibration_response_motor_id = None
-            self._calibration_in_progress = None
             self._calibration_success.clear()
-            self._calibration_failed.clear()
+            self._stop_disable_polling()
             self._enabled = False
             self._set_enabled_button_state(False)
             self.status_label.setText(
@@ -433,29 +421,23 @@ class MotorControlPage(QWidget):
         if self._enabled:
             self._start_sweep("disable", list(range(MOTOR_COUNT)), 0.0)
         else:
+            self._stop_disable_polling()
             self._start_sweep("enable", list(range(MOTOR_COUNT)), 0.0)
 
     def _calibrate_all(self) -> None:
         if not self._can_start_operation():
             return
 
+        self._stop_disable_polling()
         self._stage_timer.stop()
         self._calibration_timeout_timer.stop()
+        self._calibration_generation += 1
         self._enable_settle_pending = False
         self._enabled = False
         self._set_enabled_button_state(False)
         self._calibration_stage = "disabling"
-        self._calibration_waiting.clear()
         self._calibration_command_replies.clear()
-        self._calibration_accepted.clear()
-        self._calibration_started_at.clear()
-        self._calibration_verification_waiting.clear()
-        self._calibration_verification_scheduled.clear()
-        self._calibration_response_timer.stop()
-        self._calibration_response_motor_id = None
-        self._calibration_in_progress = None
         self._calibration_success.clear()
-        self._calibration_failed.clear()
         self._start_sweep(
             "calibration_disable",
             list(range(MOTOR_COUNT)),
@@ -488,7 +470,6 @@ class MotorControlPage(QWidget):
             return
 
         motor_id = self._sweep_ids[self._sweep_index]
-        self._active_motor_id = motor_id
         command = {
             "enable": COMMAND_ENABLE,
             "disable": COMMAND_DISABLE,
@@ -498,33 +479,15 @@ class MotorControlPage(QWidget):
 
         callback = None
         if kind == "calibrate":
-            self._calibration_waiting.add(motor_id)
-            self._calibration_started_at[motor_id] = monotonic()
+            generation = self._calibration_generation
             callback = (
-                lambda response, expected_id=motor_id:
-                self._on_calibration_command_response(expected_id, response)
+                lambda response, expected_id=motor_id, token=generation:
+                self._on_calibration_response(expected_id, token, response)
             )
 
-        if kind != "calibrate":
-            self._sweep_index += 1
-        queued = self._send_command(motor_id, command, self._sweep_value, callback)
-        if not queued:
-            if kind == "calibrate":
-                self._calibration_waiting.discard(motor_id)
-                self._complete_calibration_motor(motor_id, success=False)
-            else:
-                self._fail_sweep(kind, motor_id)
-            return
-
-        if kind == "calibrate":
-            # The bridge serializes board requests and responses; calibrate
-            # one board at a time so status queries cannot collide with a
-            # different board's in-flight CAL_ZERO response.
-            QTimer.singleShot(
-                CALIBRATION_COMMAND_GUARD_MS,
-                lambda expected_id=motor_id:
-                self._on_calibration_command_guard_timeout(expected_id),
-            )
+        self._sweep_index += 1
+        if not self._send_command(motor_id, command, self._sweep_value, callback):
+            self._fail_sweep(kind, motor_id)
             return
 
         self.status_label.setText(
@@ -543,18 +506,6 @@ class MotorControlPage(QWidget):
                 self._complete_sweep(kind)
 
     def _on_slot_timer(self) -> None:
-        if self._sweep_kind == "calibrate":
-            motor_id = self._active_motor_id
-            if (
-                motor_id is not None
-                and (
-                    motor_id in self._calibration_success
-                    or motor_id in self._calibration_failed
-                )
-            ):
-                self._active_motor_id = None
-                self._send_next_sweep_command()
-            return
         self._send_next_sweep_command()
 
     def _complete_sweep(self, kind: str) -> None:
@@ -589,11 +540,11 @@ class MotorControlPage(QWidget):
             )
             self._stage_timer.start(CALIBRATION_SETTLE_MS)
         elif kind == "calibrate":
+            self._calibration_stage = "calibration_wait"
             self.status_label.setText(
-                "\u6821\u96f6\u547d\u4ee4\u5df2\u53d1\u9001"
-                " \u00b7 \u7b49\u5f85\u5404\u677f\u56de\u4f20\u96f6\u70b9\u72b6\u6001"
+                "校零命令已排队；等待主控轮询后切换失能，不能确认校零成功"
             )
-            self._maybe_finish_calibration()
+            self._stage_timer.start(CALIBRATION_SWITCH_MS)
 
         self._refresh_controls()
 
@@ -608,12 +559,13 @@ class MotorControlPage(QWidget):
             # of boards energized; the protocol permits a no-response broadcast stop.
             self._send_command(0xFF, COMMAND_DISABLE, 0.0, None)
 
-        if kind == "calibration_disable":
+        if kind in ("calibration_disable", "calibrate"):
+            self._calibration_generation += 1
             self._calibration_stage = None
             self.status_label.setText(
-                f"ID {motor_id} \u7684\u5931\u80fd\u547d\u4ee4\u53d1\u9001\u5931\u8d25"
-                "\uff1b\u5df2\u53d6\u6d88\u6821\u96f6"
+                f"ID {motor_id} 的校零流程排队失败；已尝试广播失能，不能确认各板状态"
             )
+            self._start_disable_polling()
         else:
             self._enabled = False
             self._set_enabled_button_state(False)
@@ -644,12 +596,15 @@ class MotorControlPage(QWidget):
 
         if self._calibration_stage == "stabilizing":
             self._begin_calibration_sweep()
+        elif self._calibration_stage == "calibration_wait":
+            self._calibration_stage = "verifying"
+            self._calibration_timeout_timer.start(CALIBRATION_TIMEOUT_MS)
+            self._start_disable_polling()
 
     def _begin_calibration_sweep(self) -> None:
         if not self._connected or self._calibration_stage != "stabilizing":
             return
         self._calibration_stage = "calibrating"
-        self._calibration_timeout_timer.start(CALIBRATION_TIMEOUT_MS)
         self.status_label.setText(
             "\u6b63\u5728\u9010\u677f\u53d1\u9001\u96f6\u70b9\u6821\u51c6\u547d\u4ee4"
         )
@@ -730,263 +685,75 @@ class MotorControlPage(QWidget):
             self._sweep_kind = None
         self._refresh_controls()
 
-    def _on_calibration_command_response(
-        self,
-        motor_id: int,
-        response: MotorResponse,
+    def _on_calibration_response(
+        self, motor_id: int, generation: int, response: MotorResponse,
     ) -> None:
         if (
-            self._calibration_stage != "calibrating"
-            or motor_id not in self._calibration_waiting
-            or self._active_motor_id != motor_id
-        ):
-            return
-
-        self._calibration_waiting.remove(motor_id)
-        self._calibration_command_replies.add(motor_id)
-        if response.status & STATUS_ZERO_CALIBRATING:
-            self._calibration_accepted.add(motor_id)
-            self._calibration_in_progress = motor_id
-            self._calibration_started_at[motor_id] = monotonic()
-            self._queue_calibration_stop(motor_id)
-            return
-
-        if response.status & STATUS_ZERO_VALID:
-            # If a previous timeout reset the parser's expectation after a
-            # genuine CAL_ZERO response, this may be the final status. Still
-            # replace the table entry, but require the 100 ms minimum.
-            self._calibration_accepted.add(motor_id)
-            self._calibration_started_at.setdefault(motor_id, monotonic())
-            self._queue_calibration_stop(motor_id)
-            return
-
-        # A valid reply without either calibration or valid-zero status means
-        # the request was rejected. Replace the persistent table entry and
-        # continue with the next motor while retaining this failure.
-        self._send_command(motor_id, COMMAND_DISABLE, 0.0, None)
-        self._complete_calibration_motor(motor_id, success=False)
-
-    def _on_calibration_command_guard_timeout(self, motor_id: int) -> None:
-        if (
-            self._calibration_stage != "calibrating"
-            or self._active_motor_id != motor_id
-            or motor_id not in self._calibration_waiting
-        ):
-            return
-
-        # The scheduler may miss the brief CALIBRATING reply during Flash
-        # operations. Replace the command before it can retrigger on later
-        # poll rounds, then allow the first status query after the guard.
-        self._calibration_waiting.remove(motor_id)
-        self._calibration_verification_scheduled.add(motor_id)
-        if not self._send_command(motor_id, COMMAND_DISABLE, 0.0, None):
-            self._calibration_verification_scheduled.discard(motor_id)
-            self._complete_calibration_motor(motor_id, success=False)
-            return
-        QTimer.singleShot(
-            CALIBRATION_SETTLE_MS,
-            lambda expected_id=motor_id:
-            self._begin_calibration_verification(expected_id),
-        )
-
-    def _queue_calibration_stop(self, motor_id: int) -> None:
-        if (
-            not self._connected
-            or self._calibration_stage != "calibrating"
-            or motor_id in self._calibration_success
-            or motor_id in self._calibration_failed
-            or motor_id in self._calibration_verification_waiting
-            or motor_id in self._calibration_verification_scheduled
-        ):
-            return
-
-        # Replace CAL_ZERO in the bridge's persistent command table, but do
-        # not treat this immediate reply as the final state query. The
-        # firmware requires at least 100 ms after calibration begins before
-        # continuing to poll its status.
-        self._calibration_verification_scheduled.add(motor_id)
-        if not self._send_command(motor_id, COMMAND_DISABLE, 0.0, None):
-            self._calibration_verification_scheduled.discard(motor_id)
-            self._complete_calibration_motor(motor_id, success=False)
-            return
-        QTimer.singleShot(
-            CALIBRATION_SETTLE_MS,
-            lambda expected_id=motor_id:
-            self._begin_calibration_verification(expected_id),
-        )
-
-    def _begin_calibration_verification(self, motor_id: int) -> None:
-        self._calibration_verification_scheduled.discard(motor_id)
-        if (
-            not self._connected
-            or self._calibration_stage != "calibrating"
-            or self._active_motor_id != motor_id
-            or motor_id in self._calibration_success
-            or motor_id in self._calibration_failed
-            or motor_id in self._calibration_verification_waiting
-        ):
-            return
-
-        self._calibration_verification_waiting.add(motor_id)
-        if not self._send_command(
-            motor_id,
-            COMMAND_DISABLE,
-            0.0,
-            lambda response, expected_id=motor_id:
-            self._on_calibration_verification(expected_id, response),
-        ):
-            self._calibration_verification_waiting.discard(motor_id)
-            self._complete_calibration_motor(motor_id, success=False)
-            return
-        self._start_calibration_response_timeout(motor_id)
-        self._update_calibration_status()
-
-    def _on_calibration_verification(
-        self,
-        motor_id: int,
-        response: MotorResponse,
-    ) -> None:
-        if (
-            self._calibration_stage != "calibrating"
-            or motor_id not in self._calibration_verification_waiting
-        ):
-            return
-
-        self._calibration_verification_waiting.remove(motor_id)
-        self._stop_calibration_response_timeout(motor_id)
-        self._calibration_verification_scheduled.discard(motor_id)
-        self._calibration_command_replies.add(motor_id)
-        if motor_id not in self._calibration_accepted:
-            if response.status & STATUS_ZERO_CALIBRATING:
-                # The CAL_ZERO reply may have been lost during the firmware's
-                # Flash stall, but a later matching poll proves it was accepted.
-                self._calibration_accepted.add(motor_id)
-                self._calibration_in_progress = motor_id
-                self._calibration_started_at.setdefault(motor_id, monotonic())
-                self._update_calibration_status()
-                QTimer.singleShot(
-                    CALIBRATION_RETRY_MS,
-                    lambda expected_id=motor_id:
-                    self._retry_calibration_verification(expected_id),
-                )
-                return
-            self._complete_calibration_motor(motor_id, success=False)
-            return
-        if (
-            response.status & STATUS_ZERO_VALID
-            and not response.status & STATUS_ZERO_CALIBRATING
-        ):
-            if self._calibration_in_progress == motor_id:
-                self._calibration_in_progress = None
-            started_at = self._calibration_started_at.get(motor_id, monotonic())
-            elapsed_ms = (monotonic() - started_at) * 1000
-            if elapsed_ms < CALIBRATION_SETTLE_MS:
-                remaining_ms = max(
-                    1,
-                    int(CALIBRATION_SETTLE_MS - elapsed_ms + 0.999),
-                )
-                self._update_calibration_status()
-                QTimer.singleShot(
-                    remaining_ms,
-                    lambda expected_id=motor_id:
-                    self._retry_calibration_verification(expected_id),
-                )
-                return
-            self._complete_calibration_motor(motor_id, success=True)
-            return
-
-        self._update_calibration_status()
-        if self._calibration_in_progress == motor_id:
-            QTimer.singleShot(
-                CALIBRATION_RETRY_MS,
-                lambda expected_id=motor_id:
-                self._retry_calibration_verification(expected_id),
+            generation != self._calibration_generation
+            or self._calibration_stage not in (
+                "calibrating", "calibration_wait", "verifying",
             )
-            return
-        QTimer.singleShot(
-            CALIBRATION_RETRY_MS,
-            lambda expected_id=motor_id:
-            self._retry_calibration_verification(expected_id),
-        )
-
-    def _retry_calibration_verification(self, motor_id: int) -> None:
-        if (
-            not self._connected
-            or self._calibration_stage != "calibrating"
-            or motor_id in self._calibration_success
-            or motor_id in self._calibration_failed
-            or motor_id in self._calibration_verification_waiting
-            or motor_id in self._calibration_verification_scheduled
+            or response.motor_id != motor_id
         ):
             return
-
-        self._calibration_verification_scheduled.add(motor_id)
-        self._calibration_verification_waiting.add(motor_id)
-        if not self._send_command(
-            motor_id,
-            COMMAND_DISABLE,
-            0.0,
-            lambda response, expected_id=motor_id:
-            self._on_calibration_verification(expected_id, response),
-        ):
-            self._calibration_verification_scheduled.discard(motor_id)
-            self._calibration_verification_waiting.discard(motor_id)
-            self._complete_calibration_motor(motor_id, success=False)
-            return
-        self._start_calibration_response_timeout(motor_id)
-        self._update_calibration_status()
-
-    def _start_calibration_response_timeout(self, motor_id: int) -> None:
-        self._calibration_response_motor_id = motor_id
-        self._calibration_response_timer.start(
-            CALIBRATION_RESPONSE_TIMEOUT_MS
-        )
-
-    def _stop_calibration_response_timeout(self, motor_id: int) -> None:
-        if self._calibration_response_motor_id == motor_id:
-            self._calibration_response_timer.stop()
-            self._calibration_response_motor_id = None
-
-    def _on_calibration_response_timeout(self) -> None:
-        motor_id = self._calibration_response_motor_id
-        self._calibration_response_motor_id = None
-        if (
-            motor_id is None
-            or self._calibration_stage != "calibrating"
-            or self._active_motor_id != motor_id
-            or motor_id not in self._calibration_verification_waiting
-        ):
-            return
-
-        self._calibration_verification_waiting.discard(motor_id)
-        self._calibration_verification_scheduled.discard(motor_id)
-        # Replace a timed-out CAL_ZERO before advancing, so the bridge cannot
-        # replay the persistent calibration command on a later poll round.
-        if self._connected:
-            self._send_command(motor_id, COMMAND_DISABLE, 0.0, None)
-        self._complete_calibration_motor(motor_id, success=False)
-
-    def _complete_calibration_motor(self, motor_id: int, *, success: bool) -> None:
-        self._stop_calibration_response_timeout(motor_id)
-        if success:
+        self._calibration_command_replies.add(motor_id)
+        if response.status & STATUS_ZERO_VALID:
             self._calibration_success.add(motor_id)
         else:
-            self._calibration_failed.add(motor_id)
-        self._calibration_waiting.discard(motor_id)
-        self._calibration_verification_waiting.discard(motor_id)
-        self._calibration_verification_scheduled.discard(motor_id)
-        self._calibration_started_at.pop(motor_id, None)
-        self._calibration_accepted.discard(motor_id)
-        if self._calibration_in_progress == motor_id:
-            self._calibration_in_progress = None
+            self._calibration_success.discard(motor_id)
         self._update_calibration_status()
 
-        if self._sweep_kind != "calibrate":
+    def _start_disable_polling(self) -> None:
+        if not self._connected:
             return
-        if self._calibration_in_progress is not None:
+        self._disable_polling = True
+        self._disable_poll_error = False
+        self._disable_round_index = 0
+        self._send_next_disable_poll()
+
+    def _stop_disable_polling(self) -> None:
+        self._disable_polling = False
+        self._disable_round_index = None
+        self._disable_poll_timer.stop()
+        if self._cancel_disable_polls is not None:
+            self._cancel_disable_polls()
+
+    def _on_disable_poll_timer(self) -> None:
+        if not self._disable_polling or not self._connected:
             return
-        self._sweep_index += 1
-        self._slot_timer.start(COMMAND_SLOT_INTERVAL_MS)
+        if self._disable_round_index is None:
+            self._disable_round_index = 0
+        self._send_next_disable_poll()
+
+    def _send_next_disable_poll(self) -> None:
+        if not self._disable_polling or self._disable_round_index is None:
+            return
+        motor_id = self._disable_round_index
+        callback = None
+        if self._calibration_stage == "verifying":
+            generation = self._calibration_generation
+            callback = (
+                lambda response, expected_id=motor_id, token=generation:
+                self._on_calibration_response(expected_id, token, response)
+            )
+        if not self._send_disable_poll(motor_id, COMMAND_DISABLE, 0.0, callback):
+            self._disable_poll_error = True
+            self.status_label.setText(
+                f"ID {motor_id} 的失能轮询排队失败，正在重试；不能确认各板状态"
+            )
+            self._disable_poll_timer.start(DISABLE_ROUND_INTERVAL_MS)
+            return
+        if self._disable_poll_error:
+            self._disable_poll_error = False
+            self._update_calibration_status(
+                finished=self._calibration_stage is None
+            )
+        self._disable_round_index += 1
+        if self._disable_round_index == MOTOR_COUNT:
+            self._disable_round_index = None
+            self._disable_poll_timer.start(DISABLE_ROUND_INTERVAL_MS)
+        else:
+            self._disable_poll_timer.start(COMMAND_SLOT_INTERVAL_MS)
 
     def handle_motor_response(self, response: object) -> None:
         """Update telemetry from an already validated motor reply."""
@@ -1004,72 +771,28 @@ class MotorControlPage(QWidget):
             self._motor_cards[motor_id].update_telemetry(response)
 
     def _on_calibration_timeout(self) -> None:
-        if self._calibration_stage != "calibrating":
+        if self._calibration_stage != "verifying":
             return
-
-        self._calibration_failed.update(
-            set(range(MOTOR_COUNT)) - self._calibration_success
-        )
-        self._slot_timer.stop()
-        self._calibration_waiting.clear()
-        self._calibration_response_timer.stop()
-        self._calibration_response_motor_id = None
-        self._active_motor_id = None
-        self._calibration_accepted.clear()
-        self._calibration_started_at.clear()
-        self._calibration_verification_waiting.clear()
-        self._calibration_verification_scheduled.clear()
-        self._calibration_in_progress = None
-        if self._connected:
-            # CAL_ZERO remains the bridge's latest command until replaced.
-            self._send_command(0xFF, COMMAND_DISABLE, 0.0, None)
-        self._finish_calibration()
-
-    def _update_calibration_status(self) -> None:
-        self.status_label.setText(
-            f"\u6821\u96f6\u72b6\u6001\uff1a"
-            f"\u5df2\u6536\u5230 {len(self._calibration_command_replies)} / "
-            f"{MOTOR_COUNT} \u677f\u54cd\u5e94"
-            f"\uff0c\u6536\u5230\u96f6\u70b9\u6709\u6548\u6807\u5fd7 "
-            f"{len(self._calibration_success)} / {MOTOR_COUNT}"
-            "\uff1b\u4e0d\u80fd\u786e\u8ba4\u672c\u6b21\u6821\u96f6\u6210\u529f"
-        )
-
-    def _maybe_finish_calibration(self) -> None:
-        if self._calibration_stage != "calibrating":
-            return
-        if self._sweep_kind == "calibrate":
-            return
-        accounted = self._calibration_success | self._calibration_failed
-        if len(accounted) == MOTOR_COUNT:
-            self._finish_calibration()
-
-    def _finish_calibration(self) -> None:
-        self._calibration_timeout_timer.stop()
-        self._calibration_response_timer.stop()
-        self._calibration_response_motor_id = None
-        self._stage_timer.stop()
-        self._slot_timer.stop()
+        self._calibration_generation += 1
         self._calibration_stage = None
-        self._sweep_kind = None
-        self._enabled = False
-        self._set_enabled_button_state(False)
-
-        missing = sorted(set(range(MOTOR_COUNT)) - self._calibration_success)
-        if missing:
-            ids = ", ".join(str(motor_id) for motor_id in missing)
-            self.status_label.setText(
-                f"\u6821\u96f6\u7ed3\u675f\uff1b\u6536\u5230\u96f6\u70b9\u6709\u6548\u6807\u5fd7 "
-                f"{len(self._calibration_success)} / {MOTOR_COUNT}"
-                "\uff1b\u4e0d\u80fd\u786e\u8ba4\u672c\u6b21\u6821\u96f6\u6210\u529f"
-                f"\uff1b\u5931\u8d25 ID\uff1a{ids}"
-            )
-        else:
-            self.status_label.setText(
-                f"{MOTOR_COUNT} \u4e2a\u7535\u673a\u6536\u5230\u96f6\u70b9\u6709\u6548\u6807\u5fd7"
-                "\uff1b\u4e0d\u80fd\u786e\u8ba4\u672c\u6b21\u6821\u96f6\u6210\u529f"
-            )
+        if not self._disable_polling:
+            self._start_disable_polling()
+        self._update_calibration_status(finished=True)
         self._refresh_controls()
+
+    def _update_calibration_status(self, *, finished: bool = False) -> None:
+        missing = sorted(set(range(MOTOR_COUNT)) - self._calibration_command_replies)
+        prefix = "校零统计结束" if finished else "校零状态"
+        message = (
+            f"{prefix}：收到 {len(self._calibration_command_replies)} / {MOTOR_COUNT} 板响应，"
+            f"收到零点有效标志 {len(self._calibration_success)} / {MOTOR_COUNT}；"
+            "不能确认本次校零成功"
+        )
+        if finished and missing:
+            message += "; 未收到响应 ID：" + ", ".join(map(str, missing))
+        if self._disable_poll_error:
+            message += "；失能轮询排队失败，正在重试，不能确认各板状态"
+        self.status_label.setText(message)
 
     def _on_target_changed(self, _motor_id: int, _degrees: float) -> None:
         # Each position slot samples the latest slider value for its own motor.
